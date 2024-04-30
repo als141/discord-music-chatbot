@@ -31,6 +31,7 @@ from discord import InteractionResponse
 from googleapiclient.discovery import build
 import spotipy
 from spotipy.oauth2 import SpotifyClientCredentials
+import random
 
 load_dotenv()
 DISCORD_TOKEN = os.getenv('REONA_TOKEN')
@@ -69,8 +70,29 @@ ytdl_format_options = {
     'default_search': 'auto',
     'source_address': '0.0.0.0'
 }
+# mp3でダウンロードするためのオプション
+ytdl_mp3_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': './music/%(title)s-%(id)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    'postprocessors': [{
+        'key': 'FFmpegExtractAudio',
+        'preferredcodec': 'mp3',
+        'preferredquality': '192',
+    }],
+}
+
 
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+ytdl_mp3 = youtube_dl.YoutubeDL(ytdl_mp3_options)
 # 音楽ファイルのクラス
 class MusicFilePlayer(discord.FFmpegPCMAudio):
     def __init__(self, file_path, title, video_url):
@@ -100,6 +122,17 @@ class MusicFilePlayer(discord.FFmpegPCMAudio):
         filename = ytdl.prepare_filename(data)
         return cls(filename, title=data.get('title', ''), video_url=url)
     
+    # mp3で曲をダウンロードするメソッド．返り値はclsのインスタンス
+    @classmethod
+    async def download_mp3(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl_mp3.extract_info(url, download=not stream))
+        if 'entries' in data:
+            data = data['entries'][0]
+        filename = ytdl_mp3.prepare_filename(data) + ".mp3"
+        return cls(filename, title=data.get('title', ''), video_url=url)
+
+    
 # アルバムアートのURLを取得する関数
 async def get_track_art_url(track_title):
     search_result = spotify.search(track_title, limit=1)
@@ -111,6 +144,20 @@ async def get_track_art_url(track_title):
         return image_url
     else:
         return None
+    
+async def wait_for_file(file_path, timeout=300, interval=1):
+    """
+    指定されたファイルパスのファイルが存在するまで待機する非同期関数。
+    timeout: タイムアウトまでの秒数
+    interval: チェック間隔の秒数
+    """
+    start_time = asyncio.get_event_loop().time()
+    while (asyncio.get_event_loop().time() - start_time) < timeout:
+        if os.path.exists(file_path):
+            return True
+        await asyncio.sleep(interval)
+    raise asyncio.TimeoutError(f"ファイル {file_path} が指定されたタイムアウト {timeout} 秒内に見つかりませんでした。")
+
     
 # プレイリスト操作関数 playlist.jsonには，ファイルパス，曲名，URL, アルバムアートのURLが保存されている．構成は，プレイリスト名，追加する曲の曲順，ファイルパス，曲名，URL, アルバムアートのURLとなる
 # プレイリストに曲を追加
@@ -140,11 +187,22 @@ async def extract_youtube_id(url):
     else:
         return None
 
+# ./mymusicにある音楽をランダムにファイルパスとタイトルを取得してリストを返す関数
+# {"path": "./mymusic/xxx.xxx", "title": "エゴロック - すりぃ"}
+def get_random_mymusic():
+    files = os.listdir("./mymusic/")
+    random_files = random.sample(files, 20)
+    random_mymusic = []
+    for file in random_files:
+        random_mymusic.append({"url": f"./mymusic/{file}", "title": os.path.splitext(file)[0]})
+    return random_mymusic
+
 async def get_related_videos(player: MusicFilePlayer):
     related_videos_list = []
     if not player.video_url:
-        related_videos_list.append({"url": "https://www.youtube.com/watch?v=pAgnrvo-hb4", "title": "エゴロック - すりぃ"})
-        return related_videos_list
+        # mymusicからランダムに10曲取得
+        random_mymusic = get_random_mymusic()
+        return random_mymusic
     video_id = await extract_youtube_id(player.video_url)
     url = "https://youtube-v31.p.rapidapi.com/search"
     querystring = {"relatedToVideoId":video_id,"part":"id,snippet","type":"video","maxResults":"10"}
@@ -163,7 +221,9 @@ async def get_related_videos(player: MusicFilePlayer):
             related_video_title = item["snippet"]["title"]
             related_videos_list.append({"url": video_url, "title": related_video_title})
         except KeyError:
-            related_videos_list.append({"url": "https://www.youtube.com/watch?v=pAgnrvo-hb4", "title": "エゴロック - すりぃ"}) # videoIdが見つからない場合はこのアイテムをスキップ
+             # videoIdが見つからない場合はmymusicからランダムに10曲取得
+            random_mymusic = get_random_mymusic()
+            return random_mymusic
         
     return related_videos_list
 
@@ -179,21 +239,62 @@ class MusicPlayerView(discord.ui.View):
         # スキップ処理をここに実装
         await interaction.response.defer()
         await skip_music(interaction.message)
-        await interaction.followup.send("スキップしました", ephemeral=True)
+        await interaction.followup.send("スキップしました", ephemeral=False)
         return
+    
+    # 太陽を見てしまったプレイリストのセレクトメニューを表示させるボタン
+    @discord.ui.button(label="Spotify - 太陽を見てしまった", style=discord.ButtonStyle.green)
+    async def taiyou_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await display_taiyou_select(interaction.message)
+        temp_msg = await interaction.followup.send("成功", ephemeral=True)
+        await temp_msg.delete()
+        return
+
+# 太陽を見てしまったプレイリストのセレクトメニューのUI
+class TaiyouSelect(discord.ui.View):
+    @discord.ui.select(cls=discord.ui.Select, custom_id="taiyou_select", placeholder="太陽を見てしまった", min_values=1, max_values=1)
+    async def selectMenu(self, interaction: discord.Interaction, select: discord.ui.Select):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        # 選択された太陽を見てしまったの曲を再生する処理をここに実装
+        video_url = await search_youtube(select.values[0])
+        player = await MusicFilePlayer.from_url(video_url)
+        temp_msg = await interaction.followup.send("成功", ephemeral=True)
+        await temp_msg.delete()
+        await add_queue(player, interaction.message)
+        if not interaction.guild.voice_client.is_playing():
+            await play_next(interaction.message)
+        return
+
+# 太陽を見てしまったプレイリストのセレクトメニューを表示する関数
+async def display_taiyou_select(message: discord.Message):
+    select_view = TaiyouSelect()
+    taiyou = await get_random_spotify()
+    for song in taiyou:
+        title_and_artist = song["title"] + " " + song["artist"]
+        select_view.selectMenu.add_option(label=title_and_artist, value=title_and_artist)
+    await message.channel.send("プレイリストから曲を選択してください", view=select_view)
+    return
     
 # 関連動画のセレクトメニューのUI
 class RelatedVideosSelect(discord.ui.View):
     @discord.ui.select(cls=discord.ui.Select, custom_id="related_videos_select", placeholder="関連動画", min_values=1, max_values=1)
     async def selectMenu(self, interaction: discord.Interaction, select: discord.ui.Select):
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True, thinking=True)
         # 選択された関連動画を再生する処理をここに実装
-        video_url = select.values[0]
-        player = await MusicFilePlayer.from_url(video_url)
-        await interaction.followup.send("ダウンロード完了", ephemeral=True)
-        await add_queue(player, interaction.message)
-        if not interaction.guild.voice_client.is_playing():
-            await play_next(interaction.message)
+        # valueの値が，「./mymusic」を含む場合と，URLの場合で処理を分ける
+        try:
+            if "./mymusic" in select.values[0]:
+                player = MusicFilePlayer(select.values[0], os.path.splitext(os.path.basename(select.values[0]))[0], "")
+            else:
+                player = await MusicFilePlayer.from_url(select.values[0])
+            temp_msg = await interaction.followup.send("成功", ephemeral=True)
+            await temp_msg.delete()
+            await add_queue(player, interaction.message)
+            if not interaction.guild.voice_client.is_playing():
+                await play_next(interaction.message)
+        except Exception as e:
+            await interaction.followup.send(f"エラーが発生しました: {str(e)}", ephemeral=False)
         return
 
 # 音楽オブジェクトを保存するキュー
@@ -230,7 +331,6 @@ async def download_spotify(video_url, message: discord.Message):
 
     spotfy_directry = "./spotifymusic/"
 
-
     download_files =[]
     # MusicFilePlayerクラスのインスタンスを作成し、ダウンロードしたファイルの情報を保存
     for file_name in file_names:
@@ -238,7 +338,6 @@ async def download_spotify(video_url, message: discord.Message):
         player = MusicFilePlayer(full_path, file_name, "")
         download_files.append(player)
     return download_files
-
 
 # MusicPlayerViewインスタンスを作成し、UIを表示するコード
 async def display_music_player_ui(player: MusicFilePlayer, message: discord.Message):
@@ -292,13 +391,27 @@ async def search_mymusic(query, message: discord.Message):
     files = os.listdir(mymusic_dir)
     for file in files:
         if query in file:
-            player = MusicFilePlayer(f"{mymusic_dir}{file}", file, "")
+            file_name_without_extension = os.path.splitext(file)[0]
+            player = MusicFilePlayer(f"{mymusic_dir}{file}", file_name_without_extension, "")
             await add_queue(player, message)
             if not message.guild.voice_client.is_playing():
                 await play_next(message)
             return
     await message.reply("該当する曲が見つかりませんでした")
     return
+
+# spotify「太陽を見てしまった」https://open.spotify.com/playlist/37i9dQZF1DX1KJ0jRmRVDZ?si=acfe9819b5224f5bプレイリストからランダムに20曲取得し，曲名とアーティスト名とURLを返す
+async def get_random_spotify():
+    playlist_id = "37i9dQZF1DX1KJ0jRmRVDZ"
+    spotify = spotipy.Spotify(client_credentials_manager=client_credentials_manager)
+    playlist = spotify.playlist_tracks(playlist_id)
+    random_playlist = random.sample(playlist['items'], 20)
+    random_spotify = []
+    for item in random_playlist:
+        track = item['track']
+        random_spotify.append({"title": track['name'], "artist": track['artists'][0]['name'], "url": track['external_urls']['spotify']})
+    return random_spotify
+
 
 messages=[
     {"role": "system", "content": system_prompt},
@@ -354,8 +467,8 @@ async def queue(ctx):
         await ctx.reply("再生キューに曲がありません")
         return
     queue_list = []
-    for item in que._queue:
-        queue_list.append(item.title)
+    for index, item in enumerate(que._queue, 1):
+        queue_list.append(f"{index}. {item.title}")
     embed = discord.Embed(title="再生キュー", description="\n".join(queue_list), color=discord.Color.blue())
     await ctx.reply(embed=embed)
     return
@@ -393,6 +506,61 @@ async def yp(ctx, query: str):
         await play_next(ctx)
     return
 
+# コマンドの引数にチャンネルを指定し，指定されたボイスチャンネルに接続する
+@client.hybrid_command()
+async def raid(ctx, channel: discord.VoiceChannel):
+    if ctx.guild.voice_client:
+        return
+    await channel.connect()
+    await ctx.reply("接続しました")
+    return
+
+# 太陽を見てしまったプレイリストのセレクトメニューを表示させる
+@client.hybrid_command()
+async def playlist(ctx):
+    await display_taiyou_select(ctx)
+    return
+
+# 引数にアタッチメントとして添付された音声ファイルを，引数で指定したファイル名で./mymusicに保存する
+@client.hybrid_command()
+async def upload(ctx, attachment: discord.Attachment, file_name: str):
+    # 対応する音声ファイルの拡張子リスト
+    supported_extensions = ['.mp3', '.wav', '.ogg', '.3gp', '.3g2', '.aac', '.oga', '.wma', '.asf', '.flac', '.mov', '.m4a', '.alac']
+    
+    if attachment.filename.endswith(tuple(supported_extensions)):
+        save_path = f"./mymusic/{file_name}.{attachment.filename.split('.')[-1]}"
+        await attachment.save(save_path)
+        await ctx.reply(f"{file_name} をアップロードしました。")
+    else:
+        await ctx.reply("音声ファイルの形式が正しくありません。サポートされている形式は、mp3, wav, ogg, 3gp, 3g2, aac, oga, wma, asf, flac, mov, m4a, alac です。")
+    return
+
+# 指定されたURLの曲をダウンロードし，添付ファイルとして送信する．送信するファイルは.mp3に変換して送信する．
+@client.hybrid_command()
+async def dl(ctx: commands.Context, url: str):
+    await ctx.defer()
+    player = await MusicFilePlayer.download_mp3(url)
+    # 「」をダウンロードしましたのメッセージに添付して送信する
+    try:
+        await wait_for_file(player.file_path)
+    except asyncio.TimeoutError:
+        await ctx.interaction.followup.send(f"ファイル {player.title} がタイムアウトしました", ephemeral=True)
+        return
+    await ctx.interaction.followup.send(f"{player.title} をダウンロードしました", file=discord.File(player.file_path))
+    return
+
+@client.hybrid_command()
+async def help_command(ctx):
+    # help.txtファイルからヘルプテキストを読み込む
+    with open('help.txt', 'r', encoding='utf-8') as file:
+        help_text = file.read()
+
+    # 埋め込み(embed)を作成してヘルプテキストを設定
+    embed = discord.Embed(title="Discord ボット操作ガイド", description=help_text, color=discord.Color.blue())
+
+    # ヘルプメッセージを送信
+    await ctx.reply(embed=embed)
+
 
 @client.event
 async def on_message(message):
@@ -401,19 +569,6 @@ async def on_message(message):
         return
     if message.channel.id not in channel_list:
         return
-    if "!join" in message.content:
-        msg = await message.reply("処理中です...")
-        if message.guild.voice_client:
-            await msg.delete()
-            return
-        if message.author.voice is None:
-            await msg.delete()
-            await message.channel.send("ボイスチャンネルに接続してください")
-            return
-        await message.author.voice.channel.connect()
-        await msg.delete()
-        return
-
     if "spotify" in message.content:
         if not await check_voice_channel(message):
             return
@@ -428,7 +583,7 @@ async def on_message(message):
         if not message.guild.voice_client.is_playing():
             await play_next(message)
         return
-    
+
     if "http" in message.content:
         video_url = message.content
         if not await check_voice_channel(message):
@@ -438,68 +593,63 @@ async def on_message(message):
         if "!yp" in message.content:
             video_url = video_url.replace("!yp", "")
         process_msg = await message.reply("処理中です...")
-        player = await MusicFilePlayer.from_url(video_url)
+        try:
+            player = await MusicFilePlayer.from_url(video_url)
+        except Exception as e:
+            await process_msg.delete()
+            await message.reply(f"エラーが発生しました: {str(e)}")
+            return
         await process_msg.delete()
         await add_queue(player, message)
         if not message.guild.voice_client.is_playing():
             await play_next(message)
         return
     
+    if "!join" in message.content:
+        await join(message)
+        return
+    
+    if "!raid" in message.content:
+        await raid(message, discord.utils.get(message.guild.voice_channels, name=message.content.replace("!raid", "").strip()))
+        return
+
     if "!skip" in message.content:
-        if not await check_voice_channel(message):
-            return
-        await skip_music(message)
+        await skip(message)
         return
     
     if "!leave" in message.content:
-        if not await check_voice_channel(message):
-            return
-        await message.guild.voice_client.disconnect()
+        await leave(message)
         return
     
     if "!q" in message.content:
-        if que.empty():
-            await message.reply("再生キューに曲がありません")
-            return
-        queue_list = []
-        for item in que._queue:
-            queue_list.append(item.title)
-        embed = discord.Embed(title="再生キュー", description="\n".join(queue_list), color=discord.Color.blue())
-        await message.reply(embed=embed)
+        await queue(message)
         return
     
     if "!yp" in message.content:
-        if not await check_voice_channel(message):
-            return
-        query = message.content.replace("!yp", "")
-        video_url = await search_youtube(query)
-        process_msg = await message.reply("処理中です...")
-        player = await MusicFilePlayer.from_url(video_url)
-        await process_msg.delete()
-        await add_queue(player, message)
-        if not message.guild.voice_client.is_playing():
-            await play_next(message)
+        await yp(message, message.content.replace("!yp", ""))
         return
     
     if "!search" in message.content:
-        if not await check_voice_channel(message):
-            return
-        query = message.content.replace("!search", "")
-        process_msg = await message.reply("処理中です...")
-        await search_mymusic(query, message)
-        await process_msg.delete()
+        await search(message, message.content.replace("!search", ""))
         return
     
     if "!reset" in message.content:
-        for i in range(len(messages)-1):
-            messages.pop(1)
-        await message.reply("リセットしました。")
+        await reset(message)
         return
 
     if "!mymusic" in message.content:
-        await show_mymusic(message)
+        await mymusic(message)
         return
 
+    if "!playlist" in message.content:
+        await playlist(message)
+        return
+    
+    if "!help" in message.content:
+        await help_command(message)
+        return
+
+    # gpt-3.5-turbo
     prompt = message.content
     messages.append({"role": "user", "content": prompt})
     response = clientai.chat.completions.create(
